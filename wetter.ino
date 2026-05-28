@@ -1,14 +1,28 @@
-// Example testing sketch for various DHT humidity/temperature sensors
-// Written by ladyada, public domain
+// wetter — ESP32-C3 Super Mini
+// DHT11 temp/humidity + reed switch anemometer → Home Assistant via MQTT
 
-// REQUIRES the following Arduino libraries:
-// - DHT Sensor Library: https://github.com/adafruit/DHT-sensor-library
-// - Adafruit Unified Sensor Lib: https://github.com/adafruit/Adafruit_Sensor
+// Libraries required:
+// - DHT sensor library (Adafruit)
+// - Adafruit Unified Sensor
+// - ArduinoHA
 
 #include "DHT.h"
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <ArduinoHA.h>
+#include "config.h"
 
-#define DHTPIN 4
-#define REED_PIN 5
+#define DHTPIN               4
+#define REED_PIN             5
+
+#define ANEMOMETER_RADIUS_M  0.074   // pivot to cup center, meters
+#define WIND_CAL_FACTOR      2.5     // adjust after calibration
+#define PULSES_PER_REV       2       // 2 magnets on rotor
+
+#define WIND_INTERVAL        5000    // ms between wind publishes
+#define DHT_INTERVAL         60000   // ms between temp/humidity publishes
+
+// --- Reed switch interrupt ---
 
 volatile uint32_t pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
@@ -20,74 +34,131 @@ void IRAM_ATTR onPulse() {
         lastPulseTime = now;
     }
 }
-// Feather HUZZAH ESP8266 note: use pins 3, 4, 5, 12, 13 or 14 --
-// Pin 15 can work but DHT must be disconnected during program upload.
 
-// Uncomment whatever type you're using!
-//#define DHTTYPE DHT11   // DHT 11
-#define DHTTYPE DHT11   // DHT 22  (AM2302), AM2321
-//#define DHTTYPE DHT21   // DHT 21 (AM2301)
+// --- Sensors & MQTT ---
 
-// Connect pin 1 (on the left) of the sensor to +5V
-// NOTE: If using a board with 3.3V logic like an Arduino Due connect pin 1
-// to 3.3V instead of 5V!
-// Connect pin 2 of the sensor to whatever your DHTPIN is
-// Connect pin 3 (on the right) of the sensor to GROUND (if your sensor has 3 pins)
-// Connect pin 4 (on the right) of the sensor to GROUND and leave the pin 3 EMPTY (if your sensor has 4 pins)
-// Connect a 10K resistor from pin 2 (data) to pin 1 (power) of the sensor
+DHT dht(DHTPIN, DHT11);
+WiFiClient client;
+HADevice device;
+HAMqtt mqtt(client, device);
 
-// Initialize DHT sensor.
-// Note that older versions of this library took an optional third parameter to
-// tweak the timings for faster processors.  This parameter is no longer needed
-// as the current DHT reading algorithm adjusts itself to work on faster procs.
-DHT dht(DHTPIN, DHTTYPE);
+HASensorNumber sensorTemp("wetter_temp", HASensorNumber::PrecisionP1);
+HASensorNumber sensorHumidity("wetter_humidity", HASensorNumber::PrecisionP1);
+HASensorNumber sensorWindMs("wetter_wind_ms", HASensorNumber::PrecisionP1);
+HASensorNumber sensorWindKmh("wetter_wind_kmh", HASensorNumber::PrecisionP1);
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println(F("DHTxx test!"));
+unsigned long lastWindPublish = 0;
+unsigned long lastWindRead    = 0;
+unsigned long lastDhtPublish  = 0;
 
-  dht.begin();
-
-  pinMode(REED_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(REED_PIN), onPulse, FALLING);
-  Serial.println(F("Reed switch ready on pin 5"));
+void onMqttConnected() {
+    Serial.println("Connected to broker!");
 }
 
+// --- Setup ---
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+    Serial.println("Wetter starting...");
+
+    pinMode(REED_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(REED_PIN), onPulse, FALLING);
+    Serial.println("Reed switch ready");
+
+    dht.begin();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setHostname("wetter");
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);  // C3 Super Mini antenna workaround
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(500);
+    }
+    Serial.println();
+    Serial.printf("Connected: %s\n", WiFi.localIP().toString().c_str());
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+
+    byte mac[6];
+    WiFi.macAddress(mac);
+    device.setUniqueId(mac, sizeof(mac));
+    device.setName("Wetter");
+    device.setSoftwareVersion("1.0.0");
+
+    mqtt.onConnected(onMqttConnected);
+
+    sensorTemp.setName("Temperatur");
+    sensorTemp.setDeviceClass("temperature");
+    sensorTemp.setUnitOfMeasurement("°C");
+
+    sensorHumidity.setName("Luftfeuchtigkeit");
+    sensorHumidity.setDeviceClass("humidity");
+    sensorHumidity.setUnitOfMeasurement("%");
+
+    sensorWindMs.setName("Windgeschwindigkeit m/s");
+    sensorWindMs.setUnitOfMeasurement("m/s");
+
+    sensorWindKmh.setName("Windgeschwindigkeit km/h");
+    sensorWindKmh.setDeviceClass("wind_speed");
+    sensorWindKmh.setUnitOfMeasurement("km/h");
+
+    mqtt.begin(BROKER_ADDR, MQTT_USER, MQTT_PASSWORD);
+
+    ArduinoOTA.setHostname("wetter");
+    ArduinoOTA.onStart([]() { Serial.println("OTA start"); });
+    ArduinoOTA.onEnd([]() { Serial.println("OTA end"); });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("OTA: %u%%\r", progress / (total / 100));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        Serial.printf("OTA error[%u]\n", error);
+    });
+    ArduinoOTA.begin();
+
+    lastWindRead = millis();
+}
+
+// --- Loop ---
+
 void loop() {
-  // Wait a few seconds between measurements.
-  uint32_t pulsesThisInterval = pulseCount;
-  pulseCount = 0;
-  delay(2000);
+    ArduinoOTA.handle();
+    mqtt.loop();
 
-  // Reading temperature or humidity takes about 250 milliseconds!
-  // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
-  float h = dht.readHumidity();
-  // Read temperature as Celsius (the default)
-  float t = dht.readTemperature();
-  // Read temperature as Fahrenheit (isFahrenheit = true)
-  float f = dht.readTemperature(true);
+    unsigned long now = millis();
 
-  // Check if any reads failed and exit early (to try again).
-  if (isnan(h) || isnan(t) || isnan(f)) {
-    Serial.println(F("Failed to read from DHT sensor!"));
-    return;
-  }
+    // Wind speed — every WIND_INTERVAL ms
+    if (now - lastWindPublish >= WIND_INTERVAL || lastWindPublish == 0) {
+        uint32_t pulses    = pulseCount;
+        pulseCount         = 0;
+        float interval_s   = (now - lastWindRead) / 1000.0f;
+        lastWindRead       = now;
+        lastWindPublish    = now;
 
-  // Compute heat index in Fahrenheit (the default)
-  float hif = dht.computeHeatIndex(f, h);
-  // Compute heat index in Celsius (isFahreheit = false)
-  float hic = dht.computeHeatIndex(t, h, false);
+        float rotPerSec    = pulses / (PULSES_PER_REV * interval_s);
+        float windSpeedMs  = rotPerSec * (2.0 * PI * ANEMOMETER_RADIUS_M) * WIND_CAL_FACTOR;
+        float windSpeedKmh = windSpeedMs * 3.6f;
 
-  Serial.print(F("Humidity: "));
-  Serial.print(h);
-  Serial.print(F("%  Temperature: "));
-  Serial.print(t);
-  Serial.print(F("°C "));
-  Serial.print(f);
-  Serial.print(F("°F  Heat index: "));
-  Serial.print(hic);
-  Serial.print(F("°C "));
-  Serial.print(hif);
-  Serial.print(F("°F  Pulses: "));
-  Serial.println(pulsesThisInterval);
+        Serial.printf("Pulses: %u  Wind: %.1f m/s  %.1f km/h\n", pulses, windSpeedMs, windSpeedKmh);
+        sensorWindMs.setValue(windSpeedMs);
+        sensorWindKmh.setValue(windSpeedKmh);
+    }
+
+    // Temperature + humidity — every DHT_INTERVAL ms
+    if (now - lastDhtPublish >= DHT_INTERVAL || lastDhtPublish == 0) {
+        lastDhtPublish = now;
+
+        float h = dht.readHumidity();
+        float t = dht.readTemperature();
+
+        if (isnan(h) || isnan(t)) {
+            Serial.println("DHT read failed!");
+        } else {
+            Serial.printf("Temp: %.1f°C  Humidity: %.1f%%\n", t, h);
+            sensorTemp.setValue(t);
+            sensorHumidity.setValue(h);
+        }
+    }
 }
